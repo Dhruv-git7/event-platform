@@ -1,0 +1,11 @@
+{
+  "name": "event-platform",
+  "private": true,
+  "scripts": {
+    "dev": "turbo run dev"
+  },
+  "devDependencies": {
+    "@types/uuid": "^10.0.0",
+    "turbo": "latest"
+  }
+}
