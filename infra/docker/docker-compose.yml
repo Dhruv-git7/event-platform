@@ -6,18 +6,11 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
-    healthcheck:
-      test: echo stat | nc localhost 2181
-      interval: 10s
-      timeout: 10s
-      retries: 5
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
-    depends_on:
-      zookeeper:
-        condition: service_healthy
+    depends_on: [zookeeper]
     ports:
       - "9092:9092"
     environment:
@@ -28,22 +21,12 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-    healthcheck:
-      test: kafka-broker-api-versions --bootstrap-server localhost:9092
-      interval: 15s
-      timeout: 10s
-      retries: 10
 
   redis:
     image: redis:7-alpine
     container_name: redis
     ports:
       - "6379:6379"
-    healthcheck:
-      test: redis-cli ping
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   opensearch:
     image: opensearchproject/opensearch:2.11.0
@@ -54,11 +37,6 @@ services:
       - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
     ports:
       - "9200:9200"
-    healthcheck:
-      test: curl -s http://localhost:9200/_cluster/health
-      interval: 15s
-      timeout: 10s
-      retries: 10
 
   postgres:
     image: postgres:16-alpine
@@ -71,11 +49,21 @@ services:
       POSTGRES_DB: platform
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: pg_isready -U platform
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      - ./init-postgres.sql:/docker-entrypoint-initdb.d/init.sql
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
 
 volumes:
   postgres_data:
+  clickhouse_data:
