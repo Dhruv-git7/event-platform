@@ -1,8 +1,10 @@
 'use client'
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { io, Socket } from 'socket.io-client'
-import { useAuth } from '../components/AuthProvider'
-import { getStats, getTimeline, getSummary, getEvents } from '../lib/api'
+import { useAuth } from '@/components/AuthProvider'
+import { getEvents, getStats, getTimeline, getSummary } from '@/lib/api'
+
+// ── Types ────────────────────────────────────────────────────────────────────
 
 interface NormalizedEvent {
   id: string
@@ -18,322 +20,485 @@ interface NormalizedEvent {
   confidence?: number
 }
 
-const SEV_COLORS: Record<string, string> = {
-  critical: 'bg-red-950 text-red-200 border-red-800',
-  error:    'bg-red-900 text-red-300 border-red-700',
-  warn:     'bg-yellow-900 text-yellow-300 border-yellow-700',
-  info:     'bg-blue-900 text-blue-300 border-blue-700',
-  debug:    'bg-gray-800 text-gray-400 border-gray-700',
-  unknown:  'bg-gray-800 text-gray-500 border-gray-700',
+interface StatsRow   { severity: string; count: string }
+interface Timeline   { hour: string; count: string }
+
+// ── Style helpers ─────────────────────────────────────────────────────────────
+
+const SEV_BADGE: Record<string, { bg: string; text: string }> = {
+  critical: { bg: '#7f1d1d', text: '#fca5a5' },
+  error:    { bg: '#991b1b', text: '#fecaca' },
+  warn:     { bg: '#78350f', text: '#fcd34d' },
+  info:     { bg: '#1e3a5f', text: '#93c5fd' },
+  debug:    { bg: '#1f2937', text: '#9ca3af' },
+  unknown:  { bg: '#1f2937', text: '#6b7280' },
 }
 
-const SEV_BADGE: Record<string, string> = {
-  critical: 'bg-red-700 text-white',
-  error:    'bg-red-500 text-white',
-  warn:     'bg-yellow-500 text-black',
-  info:     'bg-blue-500 text-white',
-  debug:    'bg-gray-600 text-white',
-  unknown:  'bg-gray-700 text-gray-300',
+const SEV_ROW: Record<string, string> = {
+  critical: '#2d0808',
+  error:    '#2d1010',
+  warn:     '#2d1f08',
+  info:     '#0a1929',
+  debug:    '#111827',
+  unknown:  '#111827',
 }
 
-const SEV_DOT: Record<string, string> = {
-  critical: 'bg-red-700',
-  error:    'bg-red-500',
-  warn:     'bg-yellow-500',
-  info:     'bg-blue-500',
-  debug:    'bg-gray-500',
-  unknown:  'bg-gray-600',
+const SEV_BAR: Record<string, string> = {
+  critical: '#ef4444',
+  error:    '#f87171',
+  warn:     '#fbbf24',
+  info:     '#60a5fa',
+  debug:    '#6b7280',
+  unknown:  '#374151',
 }
+
+const SEVERITIES = ['all', 'critical', 'error', 'warn', 'info', 'debug']
+
+function Badge({ sev }: { sev: string }) {
+  const s = SEV_BADGE[sev] ?? SEV_BADGE.unknown
+  return (
+    <span style={{
+      background: s.bg, color: s.text,
+      padding: '2px 8px', borderRadius: '4px',
+      fontSize: '11px', fontWeight: 700, letterSpacing: '0.04em',
+      textTransform: 'uppercase', whiteSpace: 'nowrap'
+    }}>
+      {sev}
+    </span>
+  )
+}
+
+function sourceTag(ev: NormalizedEvent) {
+  return ev.source?.type ?? (ev.data as any)?.sourceType ?? 'unknown'
+}
+
+function eventTime(ev: NormalizedEvent) {
+  const t = ev.timestamp ?? ev.ingested_at ?? ev.event_time
+  if (!t) return '—'
+  return new Date(t).toLocaleTimeString()
+}
+
+function parserLabel(ev: NormalizedEvent) {
+  const p = ev.meta?.parserUsed ?? ev.parser_used ?? '—'
+  const c = ev.meta?.confidence ?? ev.confidence
+  return c != null ? `${p} · ${Math.round(c * 100)}%` : p
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
+
+const LIMIT = 50
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? 'http://localhost:4001'
 
 export default function Dashboard() {
-  const { user, logout }     = useAuth()
-  const [tab, setTab]        = useState<'live' | 'search'>('live')
+  const { user, logout } = useAuth()
+
+  // ── Live stream state ──────────────────────────────────────────────────────
   const [liveEvents, setLiveEvents]   = useState<NormalizedEvent[]>([])
   const [connected,  setConnected]    = useState(false)
-  const [search,     setSearch]       = useState('')
-  const [sevFilter,  setSevFilter]    = useState('')
-  const [histEvents, setHistEvents]   = useState<NormalizedEvent[]>([])
-  const [histTotal,  setHistTotal]    = useState(0)
-  const [histPage,   setHistPage]     = useState(0)
-  const [histLoading,setHistLoading]  = useState(false)
-  const [stats,      setStats]        = useState<{severity:string,count:string}[]>([])
-  const [timeline,   setTimeline]     = useState<{hour:string,count:string}[]>([])
-  const [summary,    setSummary]      = useState<any>({})
-  const [selected,   setSelected]     = useState<NormalizedEvent | null>(null)
   const socketRef = useRef<Socket | null>(null)
-  const LIMIT = 50
 
-  // Live socket
+  // ── Search / history state ─────────────────────────────────────────────────
+  const [tab,         setTab]         = useState<'live' | 'search'>('live')
+  const [searchInput, setSearchInput] = useState('')   // what user is typing
+  const [activeSearch, setActiveSearch] = useState('') // last submitted search
+  const [activeSev,   setActiveSev]   = useState('')   // current severity filter
+  const [histEvents,  setHistEvents]  = useState<NormalizedEvent[]>([])
+  const [histTotal,   setHistTotal]   = useState(0)
+  const [histPage,    setHistPage]    = useState(0)
+  const [histLoading, setHistLoading] = useState(false)
+  const [histError,   setHistError]   = useState('')
+
+  // ── Analytics state ────────────────────────────────────────────────────────
+  const [stats,   setStats]   = useState<StatsRow[]>([])
+  const [timeline, setTimeline] = useState<Timeline[]>([])
+  const [summary, setSummary] = useState<any>({})
+
+  // ── Expanded event ──────────────────────────────────────────────────────────
+  const [expanded, setExpanded] = useState<string | null>(null)
+
+  // ── Socket.io ─────────────────────────────────────────────────────────────
   useEffect(() => {
-    const s = io('http://localhost:4001')
+    const s = io(WS_URL, { transports: ['websocket', 'polling'] })
     socketRef.current = s
     s.on('connect',    () => setConnected(true))
     s.on('disconnect', () => setConnected(false))
-    s.on('event', (ev: NormalizedEvent) =>
-      setLiveEvents(prev => [ev, ...prev].slice(0, 500))
-    )
+    s.on('event', (ev: NormalizedEvent) => {
+      setLiveEvents(prev => [ev, ...prev].slice(0, 1000))
+    })
     return () => { s.disconnect() }
   }, [])
 
-  // Analytics
+  // ── Load recent events from DB on mount so refresh doesn't lose history ────
   useEffect(() => {
-    getStats().then(d => d && setStats(d.stats ?? []))
-    getTimeline().then(d => d && setTimeline(d.timeline ?? []))
-    getSummary().then(d => d && setSummary(d.summary ?? {}))
-    const interval = setInterval(() => {
-      getStats().then(d => d && setStats(d.stats ?? []))
-      getSummary().then(d => d && setSummary(d.summary ?? {}))
-    }, 30000)
-    return () => clearInterval(interval)
+    getEvents({ limit: 100, offset: 0 }).then(data => {
+      if (data?.events && data.events.length > 0) {
+        // Only pre-populate live tab if it's currently empty
+        setLiveEvents(prev => {
+          if (prev.length > 0) return prev  // new events already arrived, don't overwrite
+          return data.events
+        })
+      }
+    }).catch(() => {})  // fail silently — live stream still works
   }, [])
 
-  // Historical search
-  const fetchHistory = useCallback(async (page = 0, sev = sevFilter, q = search) => {
+  // ── Analytics (load on mount, refresh every 30s) ──────────────────────────
+  useEffect(() => {
+    const load = () => {
+      getStats().then(d => d && setStats(d.stats ?? []))
+      getTimeline().then(d => d && setTimeline(d.timeline ?? []))
+      getSummary().then(d => d && setSummary(d.summary ?? {}))
+    }
+    load()
+    const t = setInterval(load, 30_000)
+    return () => clearInterval(t)
+  }, [])
+
+  // ── Core fetch function — takes explicit values, no stale closures ─────────
+  const fetchHistory = useCallback(async (
+    page: number,
+    sev: string,
+    query: string
+  ) => {
     setHistLoading(true)
+    setHistError('')
     try {
       const data = await getEvents({
-        limit: LIMIT, offset: page * LIMIT,
-        ...(sev && { severity: sev }),
-        ...(q   && { search: q })
+        limit:    LIMIT,
+        offset:   page * LIMIT,
+        severity: sev   || undefined,
+        search:   query || undefined,
       })
-      if (data) { setHistEvents(data.events); setHistTotal(data.total) }
+      if (data) {
+        setHistEvents(data.events ?? [])
+        setHistTotal(data.total ?? 0)
+        setHistPage(page)
+      }
+    } catch (err: any) {
+      setHistError(err?.message ?? 'Failed to load events')
+      setHistEvents([])
+      setHistTotal(0)
     } finally {
       setHistLoading(false)
     }
-  }, [sevFilter, search])
+  }, [])   // no deps — all values passed explicitly
 
+  // ── Load history when switching to search tab ─────────────────────────────
   useEffect(() => {
-    if (tab === 'search') fetchHistory(0)
-  }, [tab])
+    if (tab === 'search') {
+      fetchHistory(0, activeSev, activeSearch)
+    }
+  }, [tab])   // intentionally only on tab change
 
-  const handleSearch = () => { setHistPage(0); fetchHistory(0, sevFilter, search) }
-  const handleSevFilter = (s: string) => {
-    setSevFilter(s)
-    if (tab === 'live') setTab('search')
-    setHistPage(0); fetchHistory(0, s, search)
+  // ── Search submit ─────────────────────────────────────────────────────────
+  const handleSearch = () => {
+    const q = searchInput.trim()
+    setActiveSearch(q)
+    setTab('search')
+    fetchHistory(0, activeSev, q)
   }
-  const handlePage = (p: number) => { setHistPage(p); fetchHistory(p) }
 
-  const maxCount = Math.max(...timeline.map(t => parseInt(t.count) || 0), 1)
-  const totalStats = stats.reduce((a, s) => a + parseInt(s.count), 0) || 1
+  const handleClearSearch = () => {
+    setSearchInput('')
+    setActiveSearch('')
+    fetchHistory(0, activeSev, '')
+  }
+
+  // ── Severity filter ───────────────────────────────────────────────────────
+  const handleSevFilter = (sev: string) => {
+    const newSev = sev === 'all' ? '' : sev
+    setActiveSev(newSev)
+    setTab('search')
+    // Pass new sev directly — don't rely on state update having propagated
+    fetchHistory(0, newSev, activeSearch)
+  }
+
+  // ── Pagination ────────────────────────────────────────────────────────────
+  const handlePage = (p: number) => {
+    fetchHistory(p, activeSev, activeSearch)
+  }
+
+  // ── Chart helpers ─────────────────────────────────────────────────────────
+  const maxBar = Math.max(...timeline.map(t => parseInt(t.count) || 0), 1)
+  const totalSev = stats.reduce((a, s) => a + parseInt(s.count), 0) || 1
 
   const displayEvents = tab === 'live' ? liveEvents : histEvents
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // RENDER
+  // ─────────────────────────────────────────────────────────────────────────
   return (
-    <main className="min-h-screen bg-gray-950 text-gray-100 p-4 font-mono text-sm">
+    <div style={{ minHeight: '100vh', background: '#030712', color: '#f1f5f9', fontFamily: 'ui-monospace, "Courier New", monospace', fontSize: '13px' }}>
 
-      {/* Top bar */}
-      <div className="flex items-center gap-3 mb-4 bg-gray-900 border border-gray-800 rounded-xl p-3">
-        <span className="text-white font-bold text-base shrink-0">Event Platform</span>
-        <div className="flex-1 flex items-center gap-2 bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5">
-          <span className="text-gray-500 text-xs">🔍</span>
+      {/* ── HEADER ── */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px 20px', background: '#0f172a', borderBottom: '1px solid #1e293b' }}>
+        <span style={{ fontSize: '16px', fontWeight: 700, color: '#f8fafc', whiteSpace: 'nowrap' }}>Event Platform</span>
+
+        {/* Search bar */}
+        <div style={{ flex: 1, display: 'flex', gap: '6px' }}>
           <input
-            className="bg-transparent outline-none text-gray-200 text-xs w-full placeholder-gray-600"
-            placeholder="Search events — type keyword and press Enter"
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && handleSearch()}
+            value={searchInput}
+            onChange={e => setSearchInput(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') handleSearch() }}
+            placeholder="Search across all event fields — press Enter or click Search"
+            style={{
+              flex: 1, padding: '7px 12px', background: '#1e293b',
+              border: '1px solid #334155', borderRadius: '5px',
+              color: '#f1f5f9', fontSize: '13px', outline: 'none', fontFamily: 'inherit'
+            }}
           />
-          {search && (
-            <button onClick={() => { setSearch(''); fetchHistory(0, sevFilter, '') }}
-              className="text-gray-500 hover:text-gray-300 text-xs">✕</button>
-          )}
-        </div>
-        <button onClick={handleSearch}
-          className="bg-purple-700 hover:bg-purple-600 text-white px-3 py-1.5 rounded-lg text-xs shrink-0">
-          Search
-        </button>
-        <div className="flex items-center gap-2 border-l border-gray-700 pl-3 shrink-0">
-          <div className={`w-1.5 h-1.5 rounded-full ${connected ? 'bg-green-400' : 'bg-red-500'}`}/>
-          <span className="text-xs text-gray-400">{connected ? 'Live' : 'Offline'}</span>
-          {user && <>
-            <span className="text-xs text-gray-500 hidden md:block">{user.email}</span>
-            <span className="text-xs bg-purple-900 text-purple-300 px-2 py-0.5 rounded">{user.role}</span>
-            <button onClick={logout} className="text-xs text-gray-600 hover:text-red-400">Logout</button>
-          </>}
-        </div>
-      </div>
-
-      {/* Stat cards */}
-      <div className="grid grid-cols-4 gap-3 mb-4">
-        {[
-          { label: 'Total events (24h)', value: parseInt(summary.total_24h ?? 0).toLocaleString(), sub: 'ingested' },
-          { label: 'Errors + Critical',  value: parseInt(summary.errors_24h ?? 0).toLocaleString(), sub: 'last 24h', red: true },
-          { label: 'Avg latency',        value: `${Math.round(summary.avg_latency_ms ?? 0)}ms`, sub: 'ingest pipeline' },
-          { label: 'Live events',        value: liveEvents.length.toString(), sub: 'this session' },
-        ].map(c => (
-          <div key={c.label} className="bg-gray-900 border border-gray-800 rounded-xl p-3">
-            <div className="text-gray-500 text-xs mb-1">{c.label}</div>
-            <div className={`text-2xl font-bold ${c.red ? 'text-red-400' : 'text-white'}`}>{c.value}</div>
-            <div className="text-gray-600 text-xs mt-0.5">{c.sub}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Charts row */}
-      <div className="grid grid-cols-3 gap-3 mb-4">
-
-        {/* Timeline chart */}
-        <div className="col-span-2 bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <div className="text-gray-500 text-xs uppercase tracking-wider mb-3">Events / hour (24h)</div>
-          <div className="flex items-end gap-1 h-20">
-            {timeline.length === 0
-              ? <div className="text-gray-700 text-xs w-full text-center pt-8">No data yet — send some events</div>
-              : timeline.map((t, i) => (
-                <div key={i} className="flex-1 flex flex-col items-center gap-1">
-                  <div
-                    className="w-full bg-blue-600 rounded-sm min-h-[2px]"
-                    style={{ height: `${(parseInt(t.count) / maxCount) * 100}%` }}
-                    title={`${t.count} events`}
-                  />
-                </div>
-              ))
-            }
-          </div>
-        </div>
-
-        {/* Severity breakdown */}
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <div className="text-gray-500 text-xs uppercase tracking-wider mb-3">By severity (24h)</div>
-          <div className="space-y-2">
-            {stats.length === 0
-              ? <div className="text-gray-700 text-xs pt-4 text-center">No data yet</div>
-              : stats.map(s => (
-                <div key={s.severity} className="flex items-center gap-2">
-                  <div className={`w-2 h-2 rounded-full shrink-0 ${SEV_DOT[s.severity] ?? 'bg-gray-600'}`}/>
-                  <span className="text-gray-400 text-xs w-14 shrink-0">{s.severity}</span>
-                  <div className="flex-1 h-1.5 bg-gray-800 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-blue-500 rounded-full"
-                      style={{ width: `${(parseInt(s.count) / totalStats) * 100}%` }}
-                    />
-                  </div>
-                  <span className="text-gray-300 text-xs w-8 text-right">{s.count}</span>
-                </div>
-              ))
-            }
-          </div>
-        </div>
-      </div>
-
-      {/* Events panel */}
-      <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-
-        {/* Tabs + filters */}
-        <div className="flex items-center gap-1 border-b border-gray-800 px-4 pt-2">
-          {(['live', 'search'] as const).map(t => (
-            <button key={t} onClick={() => setTab(t)}
-              className={`px-3 py-2 text-xs border-b-2 -mb-px transition-colors ${
-                tab === t
-                  ? 'border-purple-500 text-white'
-                  : 'border-transparent text-gray-500 hover:text-gray-300'
-              }`}>
-              {t === 'live' ? `Live stream (${liveEvents.length})` : `Search history (${histTotal})`}
+          <button onClick={handleSearch}
+            style={{ padding: '7px 16px', background: '#6d28d9', color: '#fff', border: 'none', borderRadius: '5px', cursor: 'pointer', fontSize: '13px', fontWeight: 500 }}>
+            Search
+          </button>
+          {activeSearch && (
+            <button onClick={handleClearSearch}
+              style={{ padding: '7px 12px', background: '#1e293b', color: '#94a3b8', border: '1px solid #334155', borderRadius: '5px', cursor: 'pointer', fontSize: '13px' }}>
+              Clear
             </button>
-          ))}
-          <div className="flex-1"/>
-          <div className="flex gap-1 pb-2">
-            {['', 'critical', 'error', 'warn', 'info', 'debug'].map(s => (
-              <button key={s} onClick={() => handleSevFilter(s)}
-                className={`px-2 py-1 text-xs rounded-full border transition-colors ${
-                  sevFilter === s
-                    ? 'bg-purple-900 border-purple-700 text-purple-300'
-                    : 'border-gray-700 text-gray-500 hover:text-gray-300'
-                }`}>
-                {s || 'all'}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* Column headers */}
-        <div className="grid grid-cols-12 gap-2 px-4 py-2 bg-gray-950 text-gray-600 text-xs uppercase tracking-wider">
-          <span className="col-span-2">Severity</span>
-          <span className="col-span-2">Source</span>
-          <span className="col-span-2">Time</span>
-          <span className="col-span-4">Fields</span>
-          <span className="col-span-2">Parser</span>
-        </div>
-
-        {/* Event rows */}
-        <div className="divide-y divide-gray-800 max-h-96 overflow-y-auto">
-          {displayEvents.length === 0 && (
-            <div className="text-center py-16 text-gray-700">
-              {tab === 'live'
-                ? 'Waiting for events — POST to http://localhost:4000/ingest'
-                : histLoading ? 'Loading...' : 'No events found'
-              }
-            </div>
           )}
-          {displayEvents.map(ev => (
-            <div key={ev.id}
-              onClick={() => setSelected(selected?.id === ev.id ? null : ev)}
-              className={`grid grid-cols-12 gap-2 px-4 py-2.5 cursor-pointer transition-colors hover:bg-gray-800 ${
-                selected?.id === ev.id ? 'bg-gray-800' : ''
-              }`}>
-              <span className="col-span-2">
-                <span className={`px-1.5 py-0.5 rounded text-xs font-bold ${SEV_BADGE[ev.severity] ?? SEV_BADGE.unknown}`}>
-                  {ev.severity.toUpperCase()}
-                </span>
-              </span>
-              <span className="col-span-2 text-purple-400 text-xs truncate">
-                {ev.source?.type ?? (ev.data as any)?.sourceType ?? '—'}
-              </span>
-              <span className="col-span-2 text-gray-500 text-xs">
-                {new Date(ev.timestamp ?? ev.ingested_at ?? '').toLocaleTimeString()}
-              </span>
-              <span className="col-span-4 text-gray-300 text-xs truncate">
-                {Object.entries(ev.data).slice(0, 2).map(([k, v]) => `${k}: ${v}`).join('  ·  ')}
-              </span>
-              <span className="col-span-2 text-gray-600 text-xs">
-                {ev.meta?.parserUsed ?? ev.parser_used} {Math.round((ev.meta?.confidence ?? ev.confidence ?? 0) * 100)}%
-              </span>
+        </div>
 
-              {/* Expanded detail */}
-              {selected?.id === ev.id && (
-                <div className="col-span-12 mt-2 bg-gray-950 rounded-lg p-3 border border-gray-700">
-                  <div className="text-gray-500 text-xs uppercase tracking-wider mb-2">All fields</div>
-                  <div className="grid grid-cols-2 gap-x-6 gap-y-1">
-                    {Object.entries(ev.data).map(([k, v]) => (
-                      <div key={k} className="flex gap-2 text-xs">
-                        <span className="text-cyan-500 shrink-0">{k}</span>
-                        <span className="text-gray-300 truncate">{String(v)}</span>
-                      </div>
-                    ))}
+        {/* Connection + user */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', whiteSpace: 'nowrap' }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '12px', color: '#94a3b8' }}>
+            <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: connected ? '#22c55e' : '#ef4444', display: 'inline-block' }} />
+            {connected ? 'Live' : 'Offline'}
+          </span>
+          {user && (
+            <>
+              <span style={{ color: '#64748b', fontSize: '12px' }}>{user.email}</span>
+              <span style={{ background: '#4c1d95', color: '#c4b5fd', padding: '2px 7px', borderRadius: '4px', fontSize: '11px' }}>{user.role}</span>
+              <button onClick={logout}
+                style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: '12px', padding: '2px 4px' }}>
+                Logout
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+
+        {/* ── STAT CARDS ── */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '10px' }}>
+          {[
+            { label: 'Total events (24h)',   value: parseInt(summary.total_24h ?? 0).toLocaleString(),             sub: 'ingested' },
+            { label: 'Errors + Critical',    value: parseInt(summary.errors_24h ?? 0).toLocaleString(),            sub: 'last 24h', red: true },
+            { label: 'Avg latency',          value: `${Math.max(0, Math.round(summary.avg_latency_ms ?? 0))}ms`,  sub: 'pipeline' },
+            { label: 'Live this session',    value: liveEvents.length.toString(),                                  sub: 'events' },
+          ].map(card => (
+            <div key={card.label} style={{ background: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px', padding: '14px 16px' }}>
+              <div style={{ fontSize: '11px', color: '#64748b', marginBottom: '4px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{card.label}</div>
+              <div style={{ fontSize: '24px', fontWeight: 700, color: card.red ? '#f87171' : '#f8fafc' }}>{card.value}</div>
+              <div style={{ fontSize: '11px', color: '#475569', marginTop: '2px' }}>{card.sub}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* ── CHARTS ROW ── */}
+        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '10px' }}>
+
+          {/* Timeline */}
+          <div style={{ background: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px', padding: '14px 16px' }}>
+            <div style={{ fontSize: '11px', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '10px' }}>Events per hour (24h)</div>
+            {timeline.length === 0 ? (
+              <div style={{ height: '72px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#334155', fontSize: '12px' }}>No data yet — send some events</div>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'flex-end', gap: '3px', height: '72px' }}>
+                {timeline.map((t, i) => (
+                  <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%', justifyContent: 'flex-end' }}>
+                    <div title={`${t.count} events`}
+                      style={{ width: '100%', background: '#3b82f6', borderRadius: '2px 2px 0 0', minHeight: '2px', height: `${Math.round((parseInt(t.count) / maxBar) * 100)}%` }} />
                   </div>
-                  <div className="mt-2 pt-2 border-t border-gray-800 text-gray-600 text-xs">
-                    ID: {ev.id}
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Severity breakdown */}
+          <div style={{ background: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px', padding: '14px 16px' }}>
+            <div style={{ fontSize: '11px', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '10px' }}>By severity (24h)</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '7px' }}>
+              {stats.length === 0 ? (
+                <div style={{ color: '#334155', fontSize: '12px', paddingTop: '8px' }}>No data yet</div>
+              ) : (
+                stats.map(s => (
+                  <div key={s.severity} style={{ display: 'flex', alignItems: 'center', gap: '7px' }}>
+                    <div style={{ width: '7px', height: '7px', borderRadius: '50%', background: SEV_BAR[s.severity] ?? '#374151', flexShrink: 0 }} />
+                    <span style={{ fontSize: '11px', color: '#94a3b8', width: '52px' }}>{s.severity}</span>
+                    <div style={{ flex: 1, height: '5px', background: '#1e293b', borderRadius: '3px', overflow: 'hidden' }}>
+                      <div style={{ height: '100%', background: SEV_BAR[s.severity] ?? '#374151', borderRadius: '3px', width: `${Math.round((parseInt(s.count) / totalSev) * 100)}%` }} />
+                    </div>
+                    <span style={{ fontSize: '11px', color: '#e2e8f0', minWidth: '24px', textAlign: 'right' }}>{s.count}</span>
                   </div>
-                </div>
+                ))
               )}
             </div>
-          ))}
+          </div>
         </div>
 
-        {/* Pagination — only show on search tab */}
-        {tab === 'search' && histTotal > LIMIT && (
-          <div className="flex items-center justify-between px-4 py-3 border-t border-gray-800 text-xs text-gray-500">
-            <span>
-              Showing {histPage * LIMIT + 1}–{Math.min((histPage + 1) * LIMIT, histTotal)} of {histTotal.toLocaleString()}
-            </span>
-            <div className="flex gap-2">
-              <button
-                disabled={histPage === 0}
-                onClick={() => handlePage(histPage - 1)}
-                className="px-3 py-1 border border-gray-700 rounded disabled:opacity-30 hover:bg-gray-800">
-                ← Prev
-              </button>
-              <span className="px-3 py-1">{histPage + 1}</span>
-              <button
-                disabled={(histPage + 1) * LIMIT >= histTotal}
-                onClick={() => handlePage(histPage + 1)}
-                className="px-3 py-1 border border-gray-700 rounded disabled:opacity-30 hover:bg-gray-800">
-                Next →
-              </button>
-            </div>
+        {/* ── EVENTS PANEL ── */}
+        <div style={{ background: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px', overflow: 'hidden' }}>
+
+          {/* Tabs */}
+          <div style={{ display: 'flex', borderBottom: '1px solid #1e293b', padding: '0 16px' }}>
+            <button onClick={() => setTab('live')}
+              style={{ padding: '10px 16px', background: 'none', border: 'none', borderBottom: tab === 'live' ? '2px solid #a78bfa' : '2px solid transparent', color: tab === 'live' ? '#f8fafc' : '#64748b', cursor: 'pointer', fontSize: '13px', fontWeight: tab === 'live' ? 600 : 400, marginBottom: '-1px' }}>
+              Live stream ({liveEvents.length})
+            </button>
+            <button onClick={() => { setTab('search'); fetchHistory(0, activeSev, activeSearch) }}
+              style={{ padding: '10px 16px', background: 'none', border: 'none', borderBottom: tab === 'search' ? '2px solid #a78bfa' : '2px solid transparent', color: tab === 'search' ? '#f8fafc' : '#64748b', cursor: 'pointer', fontSize: '13px', fontWeight: tab === 'search' ? 600 : 400, marginBottom: '-1px' }}>
+              Search history {tab === 'search' && `(${histTotal})`}
+            </button>
           </div>
-        )}
+
+          {/* Filter bar */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '10px 16px', borderBottom: '1px solid #1e293b', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: '11px', color: '#64748b', marginRight: '4px' }}>Severity:</span>
+            {SEVERITIES.map(sev => {
+              const isActive = sev === 'all' ? activeSev === '' : activeSev === sev
+              return (
+                <button key={sev} onClick={() => handleSevFilter(sev)}
+                  style={{
+                    padding: '3px 10px', border: `1px solid ${isActive ? '#7c3aed' : '#334155'}`,
+                    borderRadius: '20px', background: isActive ? '#4c1d95' : 'transparent',
+                    color: isActive ? '#c4b5fd' : '#64748b', cursor: 'pointer', fontSize: '12px',
+                    fontFamily: 'inherit'
+                  }}>
+                  {sev}
+                </button>
+              )
+            })}
+            {(activeSev || activeSearch) && (
+              <button onClick={() => { setActiveSev(''); setActiveSearch(''); setSearchInput(''); fetchHistory(0, '', '') }}
+                style={{ marginLeft: '6px', padding: '3px 10px', border: '1px solid #334155', borderRadius: '20px', background: 'transparent', color: '#ef4444', cursor: 'pointer', fontSize: '12px', fontFamily: 'inherit' }}>
+                Clear all filters
+              </button>
+            )}
+            {activeSearch && (
+              <span style={{ fontSize: '12px', color: '#94a3b8', marginLeft: '4px' }}>
+                Searching: <strong style={{ color: '#a78bfa' }}>"{activeSearch}"</strong>
+              </span>
+            )}
+          </div>
+
+          {/* Column headers */}
+          <div style={{ display: 'grid', gridTemplateColumns: '100px 120px 90px 1fr 120px', gap: '8px', padding: '8px 16px', background: '#020617', fontSize: '11px', color: '#475569', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+            <span>Severity</span><span>Source</span><span>Time</span><span>Fields</span><span>Parser</span>
+          </div>
+
+          {/* Event rows */}
+          <div style={{ maxHeight: '420px', overflowY: 'auto' }}>
+
+            {/* Loading */}
+            {tab === 'search' && histLoading && (
+              <div style={{ padding: '40px', textAlign: 'center', color: '#475569', fontSize: '13px' }}>Loading...</div>
+            )}
+
+            {/* Error */}
+            {tab === 'search' && histError && !histLoading && (
+              <div style={{ padding: '24px 16px', textAlign: 'center' }}>
+                <div style={{ color: '#f87171', fontSize: '13px', marginBottom: '6px' }}>Failed to load events</div>
+                <div style={{ color: '#64748b', fontSize: '12px', marginBottom: '12px' }}>{histError}</div>
+                <button onClick={() => fetchHistory(histPage, activeSev, activeSearch)}
+                  style={{ padding: '6px 14px', background: '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: '#94a3b8', cursor: 'pointer', fontSize: '12px' }}>
+                  Retry
+                </button>
+              </div>
+            )}
+
+            {/* ── NO RESULTS ── */}
+            {!histLoading && !histError && tab === 'search' && histEvents.length === 0 && (
+              <div style={{ padding: '56px 20px', textAlign: 'center' }}>
+                <div style={{ fontSize: '32px', marginBottom: '12px', opacity: 0.3 }}>○</div>
+                <div style={{ color: '#94a3b8', fontSize: '15px', fontWeight: 600, marginBottom: '6px' }}>No results found</div>
+                <div style={{ color: '#475569', fontSize: '13px', lineHeight: '1.6' }}>
+                  {activeSearch && activeSev
+                    ? `No ${activeSev} events matching "${activeSearch}"`
+                    : activeSearch
+                    ? `No events matching "${activeSearch}"`
+                    : activeSev
+                    ? `No ${activeSev} events in the last 24 hours`
+                    : 'No events found'}
+                </div>
+                <button onClick={() => { setActiveSev(''); setActiveSearch(''); setSearchInput(''); fetchHistory(0, '', '') }}
+                  style={{ marginTop: '16px', padding: '7px 16px', background: '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: '#94a3b8', cursor: 'pointer', fontSize: '13px' }}>
+                  Clear filters
+                </button>
+              </div>
+            )}
+
+            {/* Live tab empty */}
+            {tab === 'live' && liveEvents.length === 0 && (
+              <div style={{ padding: '56px 20px', textAlign: 'center' }}>
+                <div style={{ color: '#475569', fontSize: '13px' }}>Waiting for events — POST to http://localhost:4000/ingest</div>
+              </div>
+            )}
+
+            {/* Rows */}
+            {!histLoading && displayEvents.map(ev => (
+              <div key={ev.id}>
+                <div onClick={() => setExpanded(expanded === ev.id ? null : ev.id)}
+                  style={{
+                    display: 'grid', gridTemplateColumns: '100px 120px 90px 1fr 120px',
+                    gap: '8px', padding: '9px 16px', cursor: 'pointer',
+                    borderTop: '1px solid #0f172a',
+                    background: expanded === ev.id ? '#1e293b' : (SEV_ROW[ev.severity] ?? '#111827'),
+                    transition: 'background 0.1s'
+                  }}>
+                  <span><Badge sev={ev.severity} /></span>
+                  <span style={{ color: '#a78bfa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sourceTag(ev)}</span>
+                  <span style={{ color: '#475569', whiteSpace: 'nowrap' }}>{eventTime(ev)}</span>
+                  <span style={{ color: '#cbd5e1', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {Object.entries(ev.data).slice(0, 3).map(([k, v]) => `${k}: ${v}`).join('  ·  ')}
+                  </span>
+                  <span style={{ color: '#475569', fontSize: '11px', whiteSpace: 'nowrap' }}>{parserLabel(ev)}</span>
+                </div>
+
+                {/* Expanded detail */}
+                {expanded === ev.id && (
+                  <div style={{ background: '#020617', borderTop: '1px solid #1e293b', borderBottom: '1px solid #1e293b', padding: '12px 20px' }}>
+                    <div style={{ fontSize: '11px', color: '#475569', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px' }}>All fields</div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 32px' }}>
+                      {Object.entries(ev.data).map(([k, v]) => (
+                        <div key={k} style={{ display: 'flex', gap: '8px', alignItems: 'baseline' }}>
+                          <span style={{ color: '#22d3ee', fontSize: '12px', whiteSpace: 'nowrap' }}>{k}</span>
+                          <span style={{ color: '#e2e8f0', fontSize: '12px', wordBreak: 'break-all' }}>{String(v)}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ marginTop: '10px', paddingTop: '8px', borderTop: '1px solid #1e293b', fontSize: '11px', color: '#334155' }}>
+                      Event ID: {ev.id} · Source: {sourceTag(ev)} · Parser: {parserLabel(ev)}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {/* Pagination */}
+          {tab === 'search' && !histLoading && histTotal > LIMIT && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 16px', borderTop: '1px solid #1e293b', fontSize: '12px', color: '#64748b' }}>
+              <span>Showing {histPage * LIMIT + 1}–{Math.min((histPage + 1) * LIMIT, histTotal)} of {histTotal.toLocaleString()} events</span>
+              <div style={{ display: 'flex', gap: '6px' }}>
+                <button
+                  disabled={histPage === 0}
+                  onClick={() => handlePage(histPage - 1)}
+                  style={{ padding: '4px 12px', background: '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: histPage === 0 ? '#334155' : '#94a3b8', cursor: histPage === 0 ? 'not-allowed' : 'pointer', fontSize: '12px', fontFamily: 'inherit' }}>
+                  Prev
+                </button>
+                <span style={{ padding: '4px 10px', color: '#e2e8f0' }}>{histPage + 1}</span>
+                <button
+                  disabled={(histPage + 1) * LIMIT >= histTotal}
+                  onClick={() => handlePage(histPage + 1)}
+                  style={{ padding: '4px 12px', background: '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: (histPage + 1) * LIMIT >= histTotal ? '#334155' : '#94a3b8', cursor: (histPage + 1) * LIMIT >= histTotal ? 'not-allowed' : 'pointer', fontSize: '12px', fontFamily: 'inherit' }}>
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
-    </main>
+    </div>
   )
 }
